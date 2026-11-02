@@ -21,6 +21,14 @@ public sealed class ApiEndpointsTests(WebApplicationFactory<Program> factory)
     }
 
     [Fact]
+    public async Task GetVersion_ReturnsProjectVersion()
+    {
+        var response = await _client.GetFromJsonAsync<VersionResponse>("/version");
+
+        Assert.Equal("1.0.0", response?.Version);
+    }
+
+    [Fact]
     public async Task GetOrders_ReturnsThreeOrders()
     {
         var response = await _client.GetAsync("/api/orders");
