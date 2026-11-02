@@ -6,39 +6,90 @@ on:
   push:
     branches: [main]
 
+# Least privilege: the job only needs to read the repository contents.
 permissions:
   contents: read
 
+# Cancel superseded runs: a new push to the same PR (or branch) cancels the
+# run still in progress, so CI time isn't spent on outdated commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   SOLUTION: src/GenAIDevOps.sln
+  # Explicit build configuration instead of relying on the Debug default.
+  CONFIGURATION: Release
+  # Exact SDK version instead of a floating "10.0.x", so every run uses the
+  # same compiler. Bump this deliberately.
+  DOTNET_SDK_VERSION: '10.0.402'
+  # Fixed package location so the cache path is known and the same on every run.
   NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned runner image instead of ubuntu-latest, which moves to new OS
+    # versions without notice.
+    runs-on: ubuntu-24.04
+    # Fail fast if something hangs instead of waiting for the 6h default.
     timeout-minutes: 15
+
+    # Explicit shell: bash with -e and pipefail, so a failing command fails the step.
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Don't leave the GITHUB_TOKEN in .git/config; later steps don't need it.
+          persist-credentials: false
 
-      - name: Setup .NET 10
+      - name: Setup .NET ${{ env.DOTNET_SDK_VERSION }}
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: ${{ env.DOTNET_SDK_VERSION }}
 
+      # The key covers every file that affects restore, plus the SDK version.
+      # No broad restore-keys fallback: a partial match would restore an old
+      # cache and save it again under the new key, so stale packages pile up.
+      # Any dependency change now gets a fresh, exact cache.
       - name: Cache NuGet packages
         uses: actions/cache@v4
         with:
           path: ${{ env.NUGET_PACKAGES }}
-          key: nuget-${{ runner.os }}-${{ hashFiles('src/**/*.csproj') }}
-          restore-keys: |
-            nuget-${{ runner.os }}-
+          key: nuget-${{ runner.os }}-sdk${{ env.DOTNET_SDK_VERSION }}-${{ hashFiles('**/*.csproj', '**/Directory.Build.props', '**/Directory.Packages.props', '**/[Nn]u[Gg]et.config', 'global.json') }}
 
       - name: Restore
-        run: dotnet restore ${{ env.SOLUTION }}
+        run: dotnet restore "$SOLUTION"
 
+      # --no-restore makes the build use exactly what was restored above.
+      # ContinuousIntegrationBuild=true gives deterministic output (normalized
+      # source paths in PDBs), so the same commit always builds the same binaries.
       - name: Build
-        run: dotnet build ${{ env.SOLUTION }} --configuration Release --no-restore
+        run: >
+          dotnet build "$SOLUTION"
+          --configuration "$CONFIGURATION"
+          --no-restore
+          -p:ContinuousIntegrationBuild=true
+
+      # Test the binaries built above and write a TRX report per test project.
+      - name: Test
+        run: >
+          dotnet test "$SOLUTION"
+          --configuration "$CONFIGURATION"
+          --no-build
+          --logger trx
+          --results-directory TestResults
+
+      # always() uploads the report even when tests fail, which is when it's needed most.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/**/*.trx
+          if-no-files-found: warn

@@ -2,6 +2,9 @@
 bin/
 obj/
 
+# Test results
+TestResults/
+
 # User-specific files
 *.user
 *.suo
