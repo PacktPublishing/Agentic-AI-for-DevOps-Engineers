@@ -1,0 +1,253 @@
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [main]
+
+# Read-only by default. Only dependency-review gets pull-requests: write
+# (job-level below) so it can post its summary comment on the PR.
+permissions:
+  contents: read
+
+# A new push to the same PR cancels the validation run still in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  SOLUTION: src/GenAIDevOps.sln
+  CONFIGURATION: Release
+  DOTNET_SDK_VERSION: '10.0.402'
+  NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-test:
+    name: Build & test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup .NET ${{ env.DOTNET_SDK_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_SDK_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NUGET_PACKAGES }}
+          key: nuget-${{ runner.os }}-sdk${{ env.DOTNET_SDK_VERSION }}-${{ hashFiles('**/*.csproj', '**/Directory.Build.props', '**/Directory.Packages.props', '**/[Nn]u[Gg]et.config', 'global.json') }}
+
+      - name: Restore
+        run: dotnet restore "$SOLUTION"
+
+      - name: Build
+        run: >
+          dotnet build "$SOLUTION"
+          --configuration "$CONFIGURATION"
+          --no-restore
+          -p:ContinuousIntegrationBuild=true
+
+      # Runs tests with Coverlet (coverlet.msbuild in the test project) and
+      # writes a Cobertura report. The job fails if a test fails or if total
+      # line coverage is below 70%.
+      - name: Test with coverage
+        run: >
+          dotnet test "$SOLUTION"
+          --configuration "$CONFIGURATION"
+          --no-build
+          --logger trx
+          --results-directory TestResults
+          -p:CollectCoverage=true
+          -p:CoverletOutputFormat=cobertura
+          -p:CoverletOutput="$GITHUB_WORKSPACE/TestResults/coverage/"
+          -p:Threshold=70
+          -p:ThresholdType=line
+          -p:ThresholdStat=total
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/**/*.trx
+          if-no-files-found: warn
+
+      # Uploaded even when the coverage gate fails, so you can see what's uncovered.
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: TestResults/coverage/coverage.cobertura.xml
+          if-no-files-found: warn
+
+  formatting-check:
+    name: Formatting check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup .NET ${{ env.DOTNET_SDK_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_SDK_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NUGET_PACKAGES }}
+          key: nuget-${{ runner.os }}-sdk${{ env.DOTNET_SDK_VERSION }}-${{ hashFiles('**/*.csproj', '**/Directory.Build.props', '**/Directory.Packages.props', '**/[Nn]u[Gg]et.config', 'global.json') }}
+
+      # dotnet format needs restored projects to evaluate style and analyzer rules.
+      - name: Restore
+        run: dotnet restore "$SOLUTION"
+
+      # Exits non-zero (failing the job) if any file doesn't match .editorconfig.
+      # Fix locally with: dotnet format src/GenAIDevOps.sln
+      - name: Verify formatting
+        run: dotnet format "$SOLUTION" --verify-no-changes --no-restore
+
+  dependency-review:
+    name: Dependency review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write # post the review summary as a PR comment
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Fails the PR if it adds dependencies with known vulnerabilities.
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure
+
+  pr-summary:
+    name: PR summary
+    # Runs last, after the other jobs, so it can report their results.
+    needs: [build-test, formatting-check, dependency-review]
+    # Post the summary even when a check failed; skip only if the run was cancelled.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write # create/update the summary comment
+
+    steps:
+      # Everything comes from the GitHub API (PR title, commits, changed files)
+      # and fixed rules below - no guessing. The comment is updated in place on
+      # each push instead of adding a new one.
+      - name: Post PR summary comment
+        uses: actions/github-script@v7
+        env:
+          BUILD_TEST: ${{ needs.build-test.result }}
+          FORMATTING: ${{ needs.formatting-check.result }}
+          DEPENDENCIES: ${{ needs.dependency-review.result }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const marker = '<!-- pr-summary -->';
+
+            const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 });
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: pr.number, per_page: 100 });
+
+            // --- Classify changed files with fixed path rules ---
+            const paths = files.map(f => f.filename);
+            const any = re => paths.some(p => re.test(p));
+            const infra = any(/^(infra|pipelines)\/|\.bicep(param)?$/);
+            const workflows = any(/^\.github\/workflows\//);
+            const tests = any(/\.Tests\//);
+            const source = any(/^src\/(?!.*\.Tests\/).*\.cs$/);
+            const deps = any(/(\.csproj|Directory\.(Build|Packages)\.props|nuget\.config)$/i);
+            const linesChanged = pr.additions + pr.deletions;
+
+            // --- Risk: highest matching rule wins ---
+            const reasons = [];
+            if (infra) reasons.push(['high', 'Infrastructure files changed']);
+            if (workflows) reasons.push(['high', 'CI/CD workflow files changed']);
+            if (linesChanged > 500) reasons.push(['high', `Large change (${linesChanged} lines)`]);
+            if (source) reasons.push(['medium', 'Application source code changed']);
+            if (deps) reasons.push(['medium', 'Project or dependency files changed']);
+            if (linesChanged > 200 && linesChanged <= 500) reasons.push(['medium', `Medium-sized change (${linesChanged} lines)`]);
+            const level = ['high', 'medium'].find(l => reasons.some(([r]) => r === l)) ?? 'low';
+            if (level === 'low') reasons.push(['low', 'Only docs, tests or other low-impact files changed']);
+
+            // --- Testing considerations ---
+            const icon = r => ({ success: '✅', failure: '❌', skipped: '⏭️' }[r] ?? '⚠️');
+            const testing = [
+              `${icon(process.env.BUILD_TEST)} Build & test (incl. 70% coverage gate): ${process.env.BUILD_TEST}`,
+              `${icon(process.env.FORMATTING)} Formatting check: ${process.env.FORMATTING}`,
+              `${icon(process.env.DEPENDENCIES)} Dependency review: ${process.env.DEPENDENCIES}`,
+            ];
+            if (source && !tests) testing.push('Source code changed without test changes. Consider adding or updating tests.');
+            if (deps) testing.push('Dependencies changed. Check the dependency review result and run the app locally.');
+            if (infra) testing.push('Infrastructure changed. Run `az deployment group what-if` against dev before merging.');
+            if (workflows) testing.push('Workflow files changed. Check that every job in this run behaved as expected.');
+
+            // --- Build the comment from a fixed template ---
+            const MAX_FILES = 50;
+            const fileLines = files.slice(0, MAX_FILES).map(f => `- \`${f.filename}\` (${f.status}, +${f.additions}/-${f.deletions})`);
+            if (files.length > MAX_FILES) fileLines.push(`- …and ${files.length - MAX_FILES} more`);
+            const commitLines = commits.map(c => `- ${c.sha.slice(0, 7)} ${c.commit.message.split('\n')[0]}`);
+
+            const body = [
+              marker,
+              `## PR summary: ${pr.title}`,
+              '',
+              '### Summary of changes',
+              `${commits.length} commit(s), ${files.length} file(s), +${pr.additions}/-${pr.deletions} lines.`,
+              '',
+              '**Commits**',
+              ...commitLines,
+              '',
+              `<details><summary>Changed files (${files.length})</summary>`,
+              '',
+              ...fileLines,
+              '',
+              '</details>',
+              '',
+              `### Risk assessment: **${level.toUpperCase()}**`,
+              ...reasons.map(([r, why]) => `- ${r}: ${why}`),
+              '',
+              '### Testing considerations',
+              ...testing.map(t => `- ${t}`),
+              '',
+              `### Infra impact: **${infra ? 'Yes' : 'No'}**`,
+              infra ? 'Files under `infra/` or `pipelines/`, or Bicep files, changed.' : 'No files under `infra/` or `pipelines/` and no Bicep files changed.',
+              '',
+              '<sub>Generated by the PR Validation workflow from the PR title, commits and changed files.</sub>',
+            ].join('\n');
+
+            // --- Create the comment once, then update it on later pushes ---
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr.number, per_page: 100 });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+            }
