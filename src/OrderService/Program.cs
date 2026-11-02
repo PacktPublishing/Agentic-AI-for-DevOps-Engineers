@@ -28,7 +28,7 @@ public sealed record HealthResponse(string Status);
 
 public static class HealthEndpoints
 {
-    public static HealthResponse GetHealthResponse() => new("ok");
+    public static HealthResponse GetHealthResponse() => new("badrequest");
 }
 
 public sealed record VersionResponse(string Version);
