@@ -1,3 +1,0 @@
-Run az containerapp update --name orderservice-api --resource-group rg-genai-devops-prod --image ghcr.io/trevoirwilliams/orderservice:bad-tag
-ERROR: The container image reference is invalid or not found.
-Error: Process completed with exit code 1.

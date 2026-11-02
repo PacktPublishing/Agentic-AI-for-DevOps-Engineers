@@ -1,9 +1,0 @@
-{
-  "IncidentId": "INC-2026-03-ORD-001",
-  "ExecutiveSummary": "Following a recent deployment of the OrderService, a significant increase in order placement latency and error rates was observed, indicating degraded service health. Investigations reveal that the deployment included an invalid container image reference, leading to operational failures.",
-  "LikelyCause": "The deployment of an invalid or non-existent container image caused the service to experience elevated error rates and latency issues.",
-  "ImmediateAction": "Confirm whether the latest deployment changed the container image or startup configuration, and validate application health and endpoint error rate.",
-  "RollbackRecommendation": "Revert traffic to the previous healthy revision and cease further rollout until the error rate has normalized.",
-  "ValidationPlan": "Verify that the error rate is below 1%, check that p95 latency is below 500 ms, and ensure there are no new deployment failures logged in CI/CD.",
-  "StakeholderMessage": "Attention: The deployment of the OrderService has caused increased latency and elevated error rates. Immediate actions are being taken to roll back to a previous stable version while an investigation into the deployment issues is conducted."
-}

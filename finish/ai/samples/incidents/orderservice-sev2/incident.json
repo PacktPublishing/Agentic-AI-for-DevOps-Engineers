@@ -1,8 +1,0 @@
-{
-  "incidentId": "INC-2026-03-ORD-001",
-  "service": "OrderService",
-  "environment": "production",
-  "severity": "SEV-2",
-  "summary": "OrderService deployment completed with errors and order placement latency increased immediately after rollout.",
-  "reportedAtUtc": "2026-03-06T10:15:00Z"
-}

@@ -1,6 +1,0 @@
-{
-  "healthy": false,
-  "errorRatePercent": 18.4,
-  "p95Ms": 2140,
-  "affectedEndpoints": ["/orders"]
-}
