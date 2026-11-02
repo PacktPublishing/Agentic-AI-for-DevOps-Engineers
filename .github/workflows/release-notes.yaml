@@ -1,0 +1,131 @@
+name: Release Notes
+
+on:
+  push:
+    branches: [main]
+
+# Least privilege: read-only by default.
+permissions:
+  contents: read
+
+jobs:
+  collect-pr-metadata:
+    name: Collect merged PR metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the draft release
+      pull-requests: read # read merged PR metadata
+
+    steps:
+      # Finds the PRs merged by this push: takes every commit between the old
+      # and new main (before...after), looks up the PR each commit belongs to,
+      # and keeps only merged PRs that targeted main. Works for merge, squash
+      # and rebase merges. No checkout needed; everything comes from the API.
+      - name: Build release-report.json
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { owner, repo } = context.repo;
+            const { before, after } = context.payload;
+
+            // A brand-new branch has before = 000…0; then only the head commit is used.
+            const isNewBranch = /^0+$/.test(before);
+            const shas = isNewBranch
+              ? [after]
+              : (await github.rest.repos.compareCommits({ owner, repo, base: before, head: after, per_page: 250 }))
+                  .data.commits.map(c => c.sha);
+
+            const pullRequests = new Map();
+            for (const sha of shas) {
+              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+              for (const pr of prs) {
+                if (!pr.merged_at || pr.base.ref !== 'main' || pullRequests.has(pr.number)) continue;
+                pullRequests.set(pr.number, {
+                  number: pr.number,
+                  title: pr.title,
+                  author: pr.user?.login ?? null,
+                  labels: pr.labels.map(l => l.name).sort(),
+                  body: pr.body ?? '',
+                  url: pr.html_url,
+                  merged_at: pr.merged_at,
+                  merge_commit_sha: pr.merge_commit_sha,
+                });
+              }
+            }
+
+            const report = {
+              repository: `${owner}/${repo}`,
+              ref: context.ref,
+              before,
+              after,
+              commit_count: shas.length,
+              pull_requests: [...pullRequests.values()].sort((a, b) => a.number - b.number),
+            };
+
+            fs.writeFileSync('release-report.json', JSON.stringify(report, null, 2) + '\n');
+            core.info(`Found ${report.pull_requests.length} merged PR(s) in ${shas.length} commit(s).`);
+
+      # Turns release-report.json into release-notes.md using only its fields
+      # (title, number, author, url, labels). Each PR goes into every group whose
+      # label it has; PRs with none of these labels go under "Other changes" so
+      # nothing is dropped. Empty groups are left out.
+      - name: Generate release-notes.md
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const report = JSON.parse(fs.readFileSync('release-report.json', 'utf8'));
+
+            // Breaking changes first so they're seen first.
+            const groups = [
+              { title: 'Breaking changes', label: 'release:major' },
+              { title: 'Features', label: 'release:minor' },
+              { title: 'Fixes', label: 'release:patch' },
+              { title: 'Infrastructure', label: 'area:infra' },
+            ];
+            const known = new Set(groups.map(g => g.label));
+
+            const line = pr => `- ${pr.title} ([#${pr.number}](${pr.url}))${pr.author ? ` by @${pr.author}` : ''}`;
+            const section = (title, prs) => prs.length ? [`## ${title}`, '', ...prs.map(line), ''] : [];
+
+            const prs = report.pull_requests;
+            const lines = [
+              '# Release notes',
+              '',
+              `Changes merged into \`${report.ref.replace('refs/heads/', '')}\` (${report.before.slice(0, 7)}...${report.after.slice(0, 7)}).`,
+              '',
+              ...groups.flatMap(g => section(g.title, prs.filter(pr => pr.labels.includes(g.label)))),
+              ...section('Other changes', prs.filter(pr => !pr.labels.some(l => known.has(l)))),
+            ];
+            if (prs.length === 0) lines.push('No merged pull requests in this push.', '');
+
+            fs.writeFileSync('release-notes.md', lines.join('\n'));
+            core.info(`Wrote release-notes.md for ${prs.length} PR(s).`);
+
+      - name: Upload release report and notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-report
+          path: |
+            release-report.json
+            release-notes.md
+          if-no-files-found: error
+
+      # Guard before reuse: stop if the notes file is missing or empty.
+      - name: Validate release notes not empty
+        run: |
+          test -s release-notes.md || (echo "::error::Release notes empty" && exit 1)
+
+      # Draft only: a human reviews and publishes it. A push to main has no tag,
+      # so the action needs tag_name; the tag is only created on publish, at
+      # target_commitish. Rename the tag/title to a real version when publishing.
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          body_path: release-notes.md
+          tag_name: draft-${{ github.sha }}
+          name: Draft release (${{ github.sha }})
+          target_commitish: ${{ github.sha }}
