@@ -113,7 +113,7 @@ jobs:
           system_prompt_file: "ai/prompts/release-notes.prompt.md"
           user_input_file: "release-report.json"
           output_file: "release-notes.md"
-          temperature: "0.1"
+          temperature: "1"
 
       - name: Upload release output artifact
         uses: actions/upload-artifact@v4
